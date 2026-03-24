@@ -1,0 +1,328 @@
+---
+- name: Deploy Spring Boot application on EC2
+  hosts: all
+  become: yes
+
+  vars:
+    app_name: spring-boot
+    app_dir: /opt/app
+    app_port: 8080
+    java_package: openjdk-21-jdk
+
+  handlers:
+    - name: restart spring-app
+      systemd:
+        name: spring-app
+        state: restarted
+        daemon_reload: yes
+
+    - name: reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Java 21
+      apt:
+        name: "{{ java_package }}"
+        state: present
+
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Install maven
+      apt:
+        name: maven
+        state: present
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy application source to server
+      copy:
+        src: ../
+        dest: "{{ app_dir }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Check if Maven wrapper properties exist
+      stat:
+        path: "{{ app_dir }}/.mvn/wrapper/maven-wrapper.properties"
+      register: mvn_wrapper_props
+
+    - name: Check if Gradle wrapper properties exist
+      stat:
+        path: "{{ app_dir }}/gradle/wrapper/gradle-wrapper.properties"
+      register: gradle_wrapper_props
+
+    - name: Check if pom.xml exists
+      stat:
+        path: "{{ app_dir }}/pom.xml"
+      register: pom_xml_stat
+
+    - name: Check if build.gradle exists
+      stat:
+        path: "{{ app_dir }}/build.gradle"
+      register: build_gradle_stat
+
+    - name: Check if build.gradle.kts exists
+      stat:
+        path: "{{ app_dir }}/build.gradle.kts"
+      register: build_gradle_kts_stat
+
+    - name: Set build tool facts
+      set_fact:
+        use_mvn_wrapper: "{{ mvn_wrapper_props.stat.exists and pom_xml_stat.stat.exists }}"
+        use_plain_mvn: "{{ (not mvn_wrapper_props.stat.exists) and pom_xml_stat.stat.exists }}"
+        use_gradle_wrapper: "{{ gradle_wrapper_props.stat.exists and (build_gradle_stat.stat.exists or build_gradle_kts_stat.stat.exists) }}"
+        use_plain_gradle: "{{ (not gradle_wrapper_props.stat.exists) and (build_gradle_stat.stat.exists or build_gradle_kts_stat.stat.exists) }}"
+
+    - name: Make mvnw executable
+      file:
+        path: "{{ app_dir }}/mvnw"
+        mode: "0755"
+      when: use_mvn_wrapper | bool
+
+    - name: Make gradlew executable
+      file:
+        path: "{{ app_dir }}/gradlew"
+        mode: "0755"
+      when: use_gradle_wrapper | bool
+
+    - name: Install gradle system package if needed
+      apt:
+        name: gradle
+        state: present
+      when: use_plain_gradle | bool
+
+    - name: Build with Maven wrapper
+      shell: |
+        cd {{ app_dir }}
+        ./mvnw clean package -DskipTests
+      become: yes
+      become_user: ubuntu
+      when: use_mvn_wrapper | bool
+
+    - name: Build with plain Maven
+      shell: |
+        cd {{ app_dir }}
+        mvn clean package -DskipTests
+      become: yes
+      become_user: ubuntu
+      when: use_plain_mvn | bool
+
+    - name: Build with Gradle wrapper
+      shell: |
+        cd {{ app_dir }}
+        ./gradlew bootJar -x test
+      become: yes
+      become_user: ubuntu
+      when: use_gradle_wrapper | bool
+
+    - name: Build with plain Gradle
+      shell: |
+        cd {{ app_dir }}
+        gradle bootJar -x test
+      become: yes
+      become_user: ubuntu
+      when: use_plain_gradle | bool
+
+    - name: Check for artifacts directory jar
+      stat:
+        path: "{{ app_dir }}/artifacts"
+      register: artifacts_dir_stat
+
+    - name: Find jar in artifacts directory
+      find:
+        paths: "{{ app_dir }}/artifacts"
+        patterns: "*.jar"
+      register: artifacts_jar_find
+      when: artifacts_dir_stat.stat.exists
+
+    - name: Check if Maven target directory exists
+      stat:
+        path: "{{ app_dir }}/target"
+      register: target_dir_stat
+
+    - name: Check if Gradle build/libs directory exists
+      stat:
+        path: "{{ app_dir }}/build/libs"
+      register: gradle_libs_dir_stat
+
+    - name: Find jar in Maven target directory
+      find:
+        paths: "{{ app_dir }}/target"
+        patterns: "*.jar"
+        excludes: "*-sources.jar,*-javadoc.jar"
+      register: maven_jar_find
+      when: target_dir_stat.stat.exists
+
+    - name: Find jar in Gradle build/libs directory
+      find:
+        paths: "{{ app_dir }}/build/libs"
+        patterns: "*.jar"
+        excludes: "*-plain.jar,*-sources.jar,*-javadoc.jar"
+      register: gradle_jar_find
+      when: gradle_libs_dir_stat.stat.exists
+
+    - name: Set app_jar from artifacts directory
+      set_fact:
+        app_jar: "{{ (artifacts_jar_find.files | sort(attribute='path') | last).path }}"
+      when:
+        - artifacts_dir_stat.stat.exists
+        - artifacts_jar_find.files is defined
+        - artifacts_jar_find.files | length > 0
+
+    - name: Set app_jar from Maven target
+      set_fact:
+        app_jar: "{{ (maven_jar_find.files | sort(attribute='path') | last).path }}"
+      when:
+        - app_jar is not defined
+        - target_dir_stat.stat.exists
+        - maven_jar_find.files is defined
+        - maven_jar_find.files | length > 0
+
+    - name: Set app_jar from Gradle build/libs
+      set_fact:
+        app_jar: "{{ (gradle_jar_find.files | sort(attribute='path') | last).path }}"
+      when:
+        - app_jar is not defined
+        - gradle_libs_dir_stat.stat.exists
+        - gradle_jar_find.files is defined
+        - gradle_jar_find.files | length > 0
+
+    - name: Fail if no jar was found
+      fail:
+        msg: "No deployable jar file was found in artifacts/, target/, or build/libs/. Ensure the build succeeded."
+      when: app_jar is not defined
+
+    - name: Deploy systemd service for spring-app
+      copy:
+        dest: /etc/systemd/system/spring-app.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Spring Boot Application - {{ app_name }}
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory={{ app_dir }}
+          ExecStart=/usr/bin/java -jar {{ app_jar }}
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=spring-app
+          Environment=SERVER_PORT={{ app_port }}
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart spring-app
+
+    - name: Enable and start spring-app service
+      systemd:
+        name: spring-app
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: restart nginx
+
+    - name: Configure nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/spring-app
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_connect_timeout 60s;
+                  proxy_read_timeout 60s;
+              }
+          }
+      notify: restart nginx
+
+    - name: Enable nginx spring-app site
+      file:
+        src: /etc/nginx/sites-available/spring-app
+        dest: /etc/nginx/sites-enabled/spring-app
+        state: link
+      notify: restart nginx
+
+    - name: Ensure nginx is started and enabled
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Wait for Spring Boot application to start
+      wait_for:
+        port: "{{ app_port }}"
+        host: 127.0.0.1
+        delay: 10
+        timeout: 120
+
+    - name: Verify application health via actuator
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/actuator/health"
+        method: GET
+        status_code: [200, 404]
+        timeout: 30
+      register: health_actuator
+      ignore_errors: yes
+
+    - name: Verify application health via /health fallback
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        method: GET
+        status_code: [200, 404]
+        timeout: 30
+      register: health_plain
+      ignore_errors: yes
+      when: health_actuator.status is not defined or health_actuator.status == 404
+
+    - name: Verify application responds on root path
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/"
+        method: GET
+        status_code: [200, 302, 404]
+        timeout: 30
+      register: health_root
+      when:
+        - (health_actuator.status is not defined or health_actuator.status == 404)
+        - (health_plain.status is not defined or health_plain.status == 404)
